@@ -73,50 +73,8 @@ pecosGages <- basinGages %>%
     site_no == "08447300" ~ "Pecos River Near Pandale, TX",
     site_no == "08447410" ~ "Pecos River Near Langtry, TX"))
 
-#Download sensor data for each site
-datList <- list()
-
-for (i in 1:nrow(pecosGages)) {
-  cat(paste("Downloading USGS data for", pecosGages$station_nm[i],"\n"))
-  parameterCd <- c("00060", "00300", "00010") 
-  tempDat <- readNWISuv(pecosGages$site_no[i], parameterCd, pecosGages$begin_date[i], pecosGages$end_date[i], tz = "UTC")
-  setDT(tempDat)
-  #Raname cols to make sense
-  tempDat <- renameNWISColumns(tempDat)
-  #Convert CFS to CMS
-  tempDat$Flow_Inst <- (tempDat$Flow_Inst * 0.028316847)
-  #Make nice timestamps
-  tempDat <- tempDat[!(is.na(tempDat$DO_Inst)), ]
-  minDate <- min(tempDat$dateTime)
-  maxDate <- max(tempDat$dateTime)
-  
-  #Date and time sequence running every 15 minutes
-  date_seq <- seq(as.POSIXct(minDate, tz = "UTC"),
-                  as.POSIXct(maxDate, tz = "UTC"),
-                  by = ("15 min"))
-  # simply a data frame of date and time running the course of the data set
-  min.fill <- data.frame(dateTime = date_seq)
-  tempDat <- merge(min.fill, tempDat, all.x = T)
-  #Fill gaps
-  tempDat$DO_Inst <- na.approx(tempDat$DO_Inst, maxgap = 24, na.rm = F)
-  tempDat$Flow_Inst <- na.approx(tempDat$Flow_Inst, maxgap = 24, na.rm = F)
-  #fill new rows with info
-  tempDat$agency_cd <- "USGS"
-  tempDat$site_no <- pecosGages$site_no[i]
-  tempDat$station_nm <- pecosGages$station_nm[i]
-  tempDat$tz_cd <- "UTC"
-  #Save to df
-  datList[[i]] <- tempDat
-  datList <- datList[lengths(datList) != 0]
-  cat(paste("Finished downloading USGS data for", pecosGages$station_nm[i],"\n"))
-}
-
-pecosDat <- do.call(rbind, datList)
-```
-
-```{r}
-no_cores <- detectCores() - 1  # Leaves one core free for other tasks
-registerDoParallel(no_cores)
+# Leaves one core free for other tasks
+registerDoParallel(detectCores() - 1)
 
 pecosDat <-
   foreach(i = 1:nrow(pecosGages), .combine = 'rbind', .packages = c("data.table", "dataRetrieval", "zoo")) %dopar% {
@@ -152,6 +110,8 @@ pecosDat <-
 }
 
 stopImplicitCluster()
+
+write_csv(pecosDat, here("Data/USGSdata.csv"))
 ```
 
 # Look at it!
@@ -206,18 +166,4 @@ doFig
 qFig
 ggsave("DOfig.png", doFig, here("Figs/"), device = "png", width = 21, height = 15, units = "cm", dpi = "retina")
 ggsave("Qfig.png", qFig, here("Figs/"), device = "png", width = 21, height = 15, units = "cm", dpi = "retina")
-```
-
-```{r}
-pecosDat %>% 
-ggplot(aes(dateTime, Flow_Inst))+
-  geom_line() +
-  labs(y = expression(Discharge~("m"^3*"s"^{-1})))+
-  theme_clean()+
-  scale_x_datetime()+
-  scale_y_continuous(labels = scales::number_format(accuracy = 0.1))+
-  theme(axis.title.x = element_blank(),
-        legend.position = "none",
-        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+
-  facet_wrap(~Site, ncol=3, scales= "free")
 ```
