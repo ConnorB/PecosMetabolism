@@ -1,0 +1,260 @@
+---
+title: "Pecos River Metabolism"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(data.table)
+library(tidyverse, warn.conflicts = F)
+options(readr.show_col_types = F)
+library(ggthemes)
+library(ggpmisc)
+library(here)
+library(styler)
+library(streamMetabolizer)
+library(rstan)
+options(mc.cores = parallel::detectCores())
+library(dataRetrieval)
+library(scales)
+library(unitted)
+library(knitr)
+library(lubridate)
+library(zoo)
+library(nasapower)
+library(imputeTS)
+```
+
+# Get USGS Data
+
+```{r}
+#Pecos River Near Orla, TX
+#Get site info from USGS
+pecosSite <- readNWISsite("08412500") %>% 
+  select(site_no, drain_area_va, alt_va, dec_lat_va, dec_long_va, dec_coord_datum_cd) %>% 
+  rename(Lat = dec_lat_va,
+         Long = dec_long_va,
+         Datum = dec_coord_datum_cd,
+         GageNum = site_no) %>% 
+  mutate(WS_km2 = drain_area_va / 0.38610216, #sq mi to sqkm
+         Elev_m = alt_va * 0.3048, #feet to meters
+         .keep = "unused") %>% 
+  mutate(SiteName =  "Pecos River Near Orla, TX") %>% 
+  relocate(SiteName, GageNum, WS_km2, Elev_m, Lat, Long, Datum)
+
+startDate <- "2014-10-29"
+endDate <- "2023-12-01"
+#Download DO, discharge, and water temp
+gageDat <- readNWISuv(siteNumbers = "08412500",
+                      parameterCd = c("00060", "00010", "00300"),
+                      startDate = startDate,
+                      endDate = endDate)
+gageDat <- renameNWISColumns(gageDat)
+gageDat <- gageDat %>% 
+  mutate(FlowCMS = Flow_Inst * 0.028316847) %>%  #cfs to cms
+    select(site_no, dateTime, Wtemp_Inst, Flow_Inst, DO_Inst) %>% 
+  rename(GageNum = site_no, temp.water = Wtemp_Inst, discharge = Flow_Inst, DO.obs = DO_Inst)
+```
+
+## Get Daily USGS Discharge for Metabolism
+
+```{r}
+# get daily values of Q, will need for model
+daily <- readNWISdv("08412500", "00060", startDate, endDate)
+daily <- renameNWISColumns(daily)
+daily <- daily %>% 
+  select(Date, Flow) %>% 
+  rename(date = Date, discharge.daily = Flow) %>% 
+  mutate(discharge.daily = discharge.daily * 0.028316847)
+```
+
+# Get NASA Data
+
+```{r}
+nasaDat <- get_power(
+  community = "sb",
+  pars = c("ALLSKY_SFC_PAR_TOT", "ALLSKY_SFC_SW_DWN", "PSC", "T2M"),
+  temporal_api = "hourly",
+  lonlat = c(pecosSite$Long, pecosSite$Lat),
+  dates = c(startDate, endDate),
+  site_elevation = pecosSite$Elev_m,
+  time_standard = "UTC")
+
+# add zeros to hour col to go from 1 to 01
+nasaDat$Hour <- str_pad(nasaDat$HR, 2, side = "left", pad = 0)
+#Merge YEAR, MO, DY, and Hour col to dateTime
+nasaDat <- nasaDat %>% 
+  unite(dateTime, YYYYMMDD, Hour, sep = " ") 
+#Fix timestamp and convert to datetime
+nasaDat$dateTime <- paste0(nasaDat$dateTime, ":00:00")
+nasaDat$dateTime <- as_datetime(nasaDat$dateTime)
+#SW to PAR
+nasaDat$light <- convert_SW_to_PAR(nasaDat$ALLSKY_SFC_SW_DWN)
+#Convert kilopascals to millibar
+nasaDat$BP <- nasaDat$PSC * 10
+
+nasaDat <- nasaDat %>% 
+  select(dateTime, light, BP)
+```
+
+# Merge USGS and NASA Data
+
+```{r}
+#Date and time sequence running every 15 minutes
+date_seq <- seq(as.POSIXct(min(gageDat$dateTime), tz = "UTC"),
+                  as.POSIXct(max(gageDat$dateTime), tz = "UTC"),
+                  by = ("15 min"))
+# simply a data frame of date and time running the course of the data set
+min.fill <- data.frame(dateTime = date_seq)
+tempDat <- merge(min.fill, gageDat, all.x = T)
+
+pecosDat <- tempDat %>% 
+  left_join(nasaDat, by = "dateTime")
+
+#Impute gaps using ARIMA model or fill with interpolation
+pecosDat$temp.water <- na.approx(pecosDat$temp.water, maxgap = 24, na.rm = F)
+pecosDat$discharge <- na.approx(pecosDat$discharge, maxgap = 24, na.rm = F)
+pecosDat$DO.obs <- na.approx(pecosDat$DO.obs, maxgap = 24, na.rm = F)
+pecosDat$light <- na.approx(pecosDat$light, maxgap = 24, na.rm = F)
+pecosDat$BP <- na.approx(pecosDat$BP, maxgap = 24, na.rm = F)
+
+#Convert UTC to Solar Time
+pecosDat$solar.time <- convert_UTC_to_solartime(pecosDat$dateTime, longitude = pecosSite$Long, time.type = "mean solar") 
+
+#Calculate depth (z) based on Raymond et al. 2012 L&O Fluids and Hyraulics, where ln(z) = 0.294 ln(Q) - 0.895 
+pecosDat$depth <- calc_depth(pecosDat$discharge)
+
+#Calculates the equilibrium saturation concentration of oxygen in water at the supplied conditions 
+pecosDat$DO.sat <- calc_DO_sat(
+  u(pecosDat$temp.water, "degC"),
+  u(pecosDat$BP, "mb"),
+  model = "garcia-benson"
+)
+
+#Group by day and calculate the number of observations
+dataObs <- pecosDat %>%
+  mutate(day = as.Date(solar.time)) %>%
+  group_by(day) %>%
+  summarize(total_obs = n())
+
+#Filter out days with incomplete observations
+completeDays <- dataObs %>%
+  filter(total_obs == 96)
+
+#Join the original data with the filtered days
+pecosDat <- pecosDat %>%
+  mutate(day = as.Date(solar.time)) %>%
+  semi_join(completeDays, by = "day") %>%
+  select(-day)
+
+#Remove the grouping
+rm(dataObs, completeDays)
+```
+
+# Check Out Data
+
+```{r}
+pecosDat %>%
+  unitted::v() %>%
+  mutate(DO.pctsat = 100 * (DO.obs / DO.sat)) %>%
+  select(solar.time, starts_with("DO")) %>%
+  gather(type, DO.value, starts_with("DO")) %>%
+  mutate(units = ifelse(type == "DO.pctsat", "DO\n(% sat)", "DO\n(mg/L)")) %>%
+  ggplot(aes(x = solar.time, y = DO.value, color = type)) +
+  geom_line() +
+  facet_grid(units ~ ., scale = "free_y") +
+  theme_base() +
+  scale_color_discrete("variable")+
+  theme(legend.position = "none")
+
+labels <- c(depth = "depth\n(m)", temp.water = "water temp\n(deg C)", light = "PAR\n(umol m^-2 s^-1)")
+pecosDat %>%
+  unitted::v() %>%
+  select(solar.time, depth, temp.water, light) %>%
+  gather(type, value, depth, temp.water, light) %>%
+  mutate(
+    type = ordered(type, levels = c("depth", "temp.water", "light")),
+    units = ordered(labels[type], unname(labels))
+  ) %>%
+  ggplot(aes(x = solar.time, y = value, color = type)) +
+  geom_line() +
+  scale_color_manual(values = c("#F8766D", "black", "darkgoldenrod1"))+
+  facet_grid(units ~ ., scale = "free_y") +
+  theme_base() +
+  theme(legend.position = "none")
+```
+
+# Metabolism
+
+```{r}
+pecosDat <- pecosDat %>% 
+  select(-dateTime, -GageNum, -BP, -discharge)
+```
+
+## Run Bayes
+
+```{r}
+#Set model name
+bayes_name <- mm_name(type = "bayes",
+                      pool_K600 = "normal",
+                      err_obs_iid = T,
+                      err_proc_iid = T)
+#Set model specs
+bayes_specs <- specs(bayes_name)
+#GPP and ER based on first bayes ruv
+bayes_specs <- revise(specs = bayes_specs,
+                      n_chains = 4,
+                      n_cores = 4,
+                      burnin_steps = 1000,
+                      saved_steps = 1000)
+                      #GPP_daily_mu = 5.427114,
+                      #ER_daily_mu = -6.317212,
+                      #K600_daily_meanlog = 0.7032425)#  based on smoothed K~Q model
+                      #K600_daily_meanlog = 0.5716235, #k based on bayes run
+                      #GPP_daily_sigma = 2,
+                      #ER_daily_sigma = 2)
+                     # other_args = c(max_treedepth = 12)) #try setting prior for k based on smoothed K~Q model
+#Run bayes
+mm <- metab(specs = bayes_specs, data = pecosDat)
+
+#Save model output to bayes out list
+pecosBayes <- get_params(mm, uncertaintiy = 'ci') #%>%
+#  select(date, GPP.daily, GPP.daily.sd, ER.daily, ER.daily.sd, K600.daily, K600.daily.sd)
+
+
+#sd to ci 
+pecosBayes <- streamMetabolizer:::mm_sd_to_ci(pecosBayes, alpha = 0.05)
+#Save model output
+write_csv(pecosBayes, here("ModelOutput/OrlaBayes.csv"))
+```
+
+```{r}
+pecosBayes %>% 
+  ggplot(aes(K600.daily, ER.daily))+
+  stat_poly_line()+
+  stat_poly_eq()+
+  geom_point()
+
+pecosBayes %>% 
+  ggplot(aes(date, GPP.daily))+
+  geom_line(color = "darkgreen")+
+  geom_line(aes(y = ER.daily), color = "darkred")+
+  labs(y = expression("g O"[2]*" m"^{-2}* "d"^{-1}))+
+  scale_x_date(labels = date_format("%b %y"),
+                   breaks = date_breaks("5 month"))+
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5)+
+  geom_errorbar(aes(ymin = GPP.daily.lower, ymax = GPP.daily.upper), alpha = 0.1)+
+  geom_errorbar(aes(ymin = ER.daily.lower, ymax = ER.daily.upper), alpha = 0.1)+
+  theme_base() -> bayesFig
+bayesFig
+
+ggsave("OrlaBayes_Color.png", bayesFig, here("Figs/"), device = "png", width = 21, height = 15, units = "cm", dpi = "retina")
+```
+
+```{r}
+traceplot(get_mcmc(mm), inc_warmup=T)
+get_fit(mm)$overall %>%
+  select(ends_with('Rhat'))
+```
