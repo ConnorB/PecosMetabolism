@@ -32,7 +32,7 @@ library(imputeTS)
 ```{r}
 #Pecos River Near Orla, TX
 #Get site info from USGS
-pecosSite <- readNWISsite("08412500") %>% 
+pecosSite <- readNWISsite("08447000") %>% 
   select(site_no, drain_area_va, alt_va, dec_lat_va, dec_long_va, dec_coord_datum_cd) %>% 
   rename(Lat = dec_lat_va,
          Long = dec_long_va,
@@ -41,13 +41,13 @@ pecosSite <- readNWISsite("08412500") %>%
   mutate(WS_km2 = drain_area_va / 0.38610216, #sq mi to sqkm
          Elev_m = alt_va * 0.3048, #feet to meters
          .keep = "unused") %>% 
-  mutate(SiteName =  "Pecos River Near Orla, TX") %>% 
+  mutate(SiteName =  "Pecos River Near Sheffield, TX") %>% 
   relocate(SiteName, GageNum, WS_km2, Elev_m, Lat, Long, Datum)
 
 startDate <- "2014-10-29"
 endDate <- "2023-12-01"
 #Download DO, discharge, and water temp
-gageDat <- readNWISuv(siteNumbers = "08412500",
+gageDat <- readNWISuv(siteNumbers = "08447000",
                       parameterCd = c("00060", "00010", "00300"),
                       startDate = startDate,
                       endDate = endDate)
@@ -227,7 +227,7 @@ pecosBayes <- get_params(mm, uncertaintiy = 'ci') #%>%
 #sd to ci 
 pecosBayes <- streamMetabolizer:::mm_sd_to_ci(pecosBayes, alpha = 0.05)
 #Save model output
-write_csv(pecosBayes, here("ModelOutput/OrlaBayes.csv"))
+write_csv(pecosBayes, here("ModelOutput/SheffieldBayes.csv"))
 ```
 
 ```{r}
@@ -250,7 +250,7 @@ pecosBayes %>%
   theme_base() -> bayesFig
 bayesFig
 
-ggsave("OrlaBayes_Color.png", bayesFig, here("Figs/"), device = "png", width = 21, height = 15, units = "cm", dpi = "retina")
+ggsave("SheffieldBayes_Color.png", bayesFig, here("Figs/"), device = "png", width = 21, height = 15, units = "cm", dpi = "retina")
 ```
 
 ```{r}
