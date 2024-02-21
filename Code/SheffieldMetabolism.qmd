@@ -30,7 +30,7 @@ library(imputeTS)
 # Get USGS Data
 
 ```{r}
-#Pecos River Near Orla, TX
+#Pecos River Near Sheffield, TX
 #Get site info from USGS
 pecosSite <- readNWISsite("08447000") %>% 
   select(site_no, drain_area_va, alt_va, dec_lat_va, dec_long_va, dec_coord_datum_cd) %>% 
@@ -44,8 +44,8 @@ pecosSite <- readNWISsite("08447000") %>%
   mutate(SiteName =  "Pecos River Near Sheffield, TX") %>% 
   relocate(SiteName, GageNum, WS_km2, Elev_m, Lat, Long, Datum)
 
-startDate <- "2014-10-29"
-endDate <- "2023-12-01"
+startDate <- "2022-01-01"
+endDate <- "2024-02-17"
 #Download DO, discharge, and water temp
 gageDat <- readNWISuv(siteNumbers = "08447000",
                       parameterCd = c("00060", "00010", "00300"),
@@ -198,7 +198,7 @@ pecosDat <- pecosDat %>%
 ```{r}
 #Set model name
 bayes_name <- mm_name(type = "bayes",
-                      pool_K600 = "binned",
+                      pool_K600 = "normal",
                       err_obs_iid = T,
                       err_proc_iid = T)
 #Set model specs
@@ -207,18 +207,18 @@ bayes_specs <- specs(bayes_name)
 bayes_specs <- revise(specs = bayes_specs,
                       n_chains = 4,
                       n_cores = 4,
-                      burnin_steps = 1000,
-                      saved_steps = 1000,
+                      burnin_steps = 500,
+                      saved_steps = 500,
+                      GPP_daily_mu = 3.6,
+                      ER_daily_mu = -4.0,
                       verbose = T)
-                      #GPP_daily_mu = 5.427114,
-                      #ER_daily_mu = -6.317212,
-                      #K600_daily_meanlog = 0.7032425)#  based on smoothed K~Q model
-                      #K600_daily_meanlog = 0.5716235, #k based on bayes run
-                      #GPP_daily_sigma = 2,
-                      #ER_daily_sigma = 2)
-                     # other_args = c(max_treedepth = 12)) #try setting prior for k based on smoothed K~Q model
+                      #K600_daily_meanlog = )
+                      #K600_daily_meanlog = , 
+                      #GPP_daily_sigma = ,
+                      #ER_daily_sigma = )
+                     # other_args = c(max_treedepth = 12))
 #Run bayes
-mm <- metab(specs = bayes_specs, data = pecosDat, data_daily = daily)
+mm <- metab(specs = bayes_specs, data = pecosDat)
 
 #Save model output to bayes out list
 pecosBayes <- get_params(mm, uncertaintiy = 'ci') #%>%
@@ -238,6 +238,7 @@ pecosBayes %>%
   geom_point()
 
 pecosBayes %>% 
+  filter(GPP.daily > 0 & ER.daily < 0) %>% 
   ggplot(aes(date, GPP.daily))+
   geom_line(color = "darkgreen")+
   geom_line(aes(y = ER.daily), color = "darkred")+
